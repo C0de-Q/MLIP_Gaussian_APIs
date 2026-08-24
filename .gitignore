@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 环境变量与密钥（绝不提交）
+.env
+
+# 编辑器 / 系统文件
+.idea/
+.vscode/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 数据文件（按需决定；大文件不要进 git）
+# data/
+# *.h5
+# *.pkl

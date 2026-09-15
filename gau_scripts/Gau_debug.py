@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
+"""Debug tool (not an MLIP interface): turn a Gaussian External input file into
+an .xyz file carrying charge and spin, and write zero energy and gradients back
+to Gaussian.
+
+Usage:
+    Gau_debug.py  layer  inputfile  outputfile   # as called by Gaussian
+    Gau_debug.py  inputfile                      # only write the xyz file
 """
-Gau_test.py — 从 Gaussian External 输入生成带 charge/spin 的 .xyz 文件
-
-Gaussian 调用方式:
-    Gau_test.py  layer  inputfile  outputfile
-    Gau_test.py  inputfile  outputfile
-    Gau_test.py  inputfile
-
-生成的 .xyz 文件格式:
-    <n_atoms>
-    <charge> <spin>
-    <element> <x> <y> <z> <atom_charge>
-    ...
-
-该 xyz 文件可直接用于 MLIP_xyz.py 做单点能计算。
-"""
-import sys
 import os
+import sys
 import numpy as np
-sys.path.insert(0, '/share/home/CodeQ/Benchmark')
-from bin.gaussian_external import get_external_coord
-from bin.constants import ELEMENTS
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from gaussian_external import parse_gaussian_args
+from gaussian_external import get_external_coord
+from constants import ELEMENTS
 
 
 def write_xyz_with_charges(ele, coordlist, atom_charges, charge, spin, xyz_path):
-    """写入带点电荷列的 .xyz 文件。"""
     n_atoms = len(ele)
     lines = [str(n_atoms), f'{charge} {spin}']
     for i in range(n_atoms):
@@ -38,15 +34,11 @@ def write_xyz_with_charges(ele, coordlist, atom_charges, charge, spin, xyz_path)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) >= 4:
-        filein = sys.argv[2]
-        fileout = sys.argv[3]
-    elif len(sys.argv) == 3:
-        filein = sys.argv[1]
-        fileout = sys.argv[2]
-    elif len(sys.argv) == 2:
-        filein = sys.argv[1]
-        fileout = None
+    n_args = len(sys.argv) - 1
+    if n_args == 1:
+        filein, fileout = sys.argv[1], None
+    elif n_args >= 3:
+        filein, fileout, _, _ = parse_gaussian_args()
     else:
         print(__doc__)
         sys.exit(1)

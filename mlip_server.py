@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
 """
-mlip_server.py — 持久化 MLIP GPU server for Gaussian ONIOM 计算
+mlip_server.py — persistent MLIP server for Gaussiancal culations
 
-在 Apptainer 容器内运行，启动时加载模型一次，通过 TCP 接收推理请求。
-避免每步优化重复加载模型，大幅加速 ONIOM 几何优化。
+Started by RunMLIPgjf.sh, it accepts inference requests over TCP. The model is
+selected with the METHOD environment variable (or -m for RunMLIPgjf.sh) and must
+be registered in calculators.METHODS.
 
-支持的模型（通过 METHOD 环境变量选择）:
-    METHOD=mace_omol   → MACE-OMol extra-large
-    METHOD=mace_off24  → MACE-OFF24 medium (默认)
-    METHOD=mace_polar  → MACE-POLAR-1-M
-    METHOD=orbmol_v2   → ORB-Mol v2
+MLIPServer contains no model-specific logic; the compute path is decided by the
+registration in the calculators package:
+  - Persistent ASE path: declarative ASE models (ASE_MODEL_SPECS, such as the
+    MACE and DPA families) build their calculator once at startup and reuse it
+    for every request.
+  - Generic path: functional models (orbmol_v2, orbmol, ANI, AIMNet2, ...) call
+    calculators.compute / compute_gradient per request. Python models that can be
+    cached are loaded once through the in-process cache; CLI models (aiqm3,
+    d4ani, gxtb) run an external program per step and cannot stay resident.
 
-环境变量:
-    MLIP_SERVER_PORT   — 监听端口 (默认 15556)
-    MLIP_SERVER_HOST   — 监听地址 (默认 127.0.0.1)
-    METHOD             — 模型选择
-    MLIP_XYZ_OUT       — 退出时保存最终结构的 XYZ 文件路径
+Environment variables:
+    MLIP_SERVER_PORT   listen port (default 15556)
+    MLIP_SERVER_HOST   listen address (default 127.0.0.1)
+    MLIP_SERVER_DEVICE device for model evaluation (default: cuda when a GPU is
+                       available, otherwise cpu)
+    METHOD             model selection
+    MLIP_XYZ_OUT       write the final structure to this XYZ file on shutdown
+    MLIP_LOG_LEVEL     log level (DEBUG/INFO/WARNING/ERROR, default INFO)
 
-合并自: server_MLIP/Mace_Omol_server.py, Mace_off_server.py, mlip_server_v1.py
+Model weight paths come from constants.py / config.env (see config.example.env
+in the repository root).
 """
 
 import socket
@@ -26,115 +35,59 @@ import os
 import signal
 import threading
 import time
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
-import torch
 import numpy as np
 from ase import Atoms
 from ase.io import write as ase_write
 
-# ═══════════════════════════════════════════════════════════════════════
-#  常量
-# ═══════════════════════════════════════════════════════════════════════
+try:  # torch is only needed for the persistent ASE path and CUDA cache release
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
 
-EV_HA = 27.211386245
-FORCE_UNIT_CONST = 51.42208619
-BOHR_TO_ANGSTROM = 0.52917721067
+from constants import ELEMENTS, server_device
+from calculators import (get_ase_spec, make_ase_calculator, prepare_ase_atoms,
+                         take_load_time)
+from gaussian_external import get_external_coord, unique_scratch_base, write_external_output_ev
+import log_utils  # importing it configures the root logger
 
-# 元素符号 (1-indexed)
-_Z_SYMBOLS = {
-    1: 'H', 2: 'He', 3: 'Li', 4: 'Be', 5: 'B', 6: 'C', 7: 'N', 8: 'O', 9: 'F', 10: 'Ne',
-    11: 'Na', 12: 'Mg', 13: 'Al', 14: 'Si', 15: 'P', 16: 'S', 17: 'Cl', 18: 'Ar',
-    19: 'K', 20: 'Ca', 21: 'Sc', 22: 'Ti', 23: 'V', 24: 'Cr', 25: 'Mn', 26: 'Fe',
-    27: 'Co', 28: 'Ni', 29: 'Cu', 30: 'Zn', 31: 'Ga', 32: 'Ge', 33: 'As', 34: 'Se',
-    35: 'Br', 36: 'Kr', 37: 'Rb', 38: 'Sr', 39: 'Y', 40: 'Zr', 41: 'Nb', 42: 'Mo',
-    43: 'Tc', 44: 'Ru', 45: 'Rh', 46: 'Pd', 47: 'Ag', 48: 'Cd', 49: 'In', 50: 'Sn',
-    51: 'Sb', 52: 'Te', 53: 'I', 54: 'Xe', 55: 'Cs', 56: 'Ba', 57: 'La', 58: 'Ce',
-    59: 'Pr', 60: 'Nd', 61: 'Pm', 62: 'Sm', 63: 'Eu', 64: 'Gd', 65: 'Tb', 66: 'Dy',
-    67: 'Ho', 68: 'Er', 69: 'Tm', 70: 'Yb', 71: 'Lu', 72: 'Hf', 73: 'Ta', 74: 'W',
-    75: 'Re', 76: 'Os', 77: 'Ir', 78: 'Pt', 79: 'Au', 80: 'Hg', 81: 'Tl', 82: 'Pb',
-    83: 'Bi', 84: 'Po', 85: 'At', 86: 'Rn',
-}
-
-# 模型配置: {METHOD: {"model_path": ..., "calculator": ..., "needs_info": bool}}
-_MODEL_BASE = '/share/home/CodeQ/.mlatom/models'
-MODEL_CONFIGS = {
-    'mace_omol': {
-        'model_path': f'{_MODEL_BASE}/MACE-omol-0-extra-large-1024.model',
-        'from': 'mace.calculators',
-        'import': 'mace_omol',
-        'needs_info': True,
-    },
-    'mace_off24': {
-        'model_path': f'{_MODEL_BASE}/MACE-OFF24_medium.model',
-        'from': 'mace.calculators',
-        'import': 'mace_off',
-        'needs_info': True,
-    },
-    'mace_polar': {
-        'model_path': f'{_MODEL_BASE}/MACE-POLAR-1-M.model',
-        'from': 'mace.calculators',
-        'import': 'mace_polar',
-        'needs_info': True,
-    },
-    'orbmol_v2': {
-        'type': 'orbmol_v2',
-        'from': 'orb_models.forcefield.pretrained',
-        'import': 'orbmol_v2',
-        'needs_info': True,
-    },
-}
+logger = logging.getLogger('mlip_server')
 
 
+def _empty_cuda_cache():
+    """Release the CUDA caching allocator's memory when CUDA is in use."""
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-# ═══════════════════════════════════════════════════════════════════════
-#  Gaussian External 接口解析
-# ═══════════════════════════════════════════════════════════════════════
 
-def parse_gau_external(filein):
-    """解析 Gaussian External 接口文件。
+def _generic_compute(method, atoms, charge, spin, deriva):
+    """Generic compute path: call the unified entry points in calculators.
 
     Returns:
-        eles: np.ndarray (natoms,) int32
-        coords: np.ndarray (natoms, 3) float64 (Å)
-        deriva: int
-        charge: int
-        spin: int
+        energy_ev: float
+        forces_ev_ang: np.ndarray (natoms,3) | None
     """
-    with open(filein, 'r') as f:
-        natoms, deriva, charge, spin = [int(s) for s in f.readline().split()]
-        eles = np.empty(natoms, dtype=np.int32)
-        coords = np.empty((natoms, 3), dtype=np.float64)
-        for i in range(natoms):
-            parts = f.readline().split()
-            eles[i] = int(parts[0])
-            coords[i, 0] = float(parts[1]) * BOHR_TO_ANGSTROM
-            coords[i, 1] = float(parts[2]) * BOHR_TO_ANGSTROM
-            coords[i, 2] = float(parts[3]) * BOHR_TO_ANGSTROM
-    return eles, coords, deriva, charge, spin
+    from calculators import compute as ml_compute, compute_gradient
 
-
-def write_gau_output(fileout, energy_ev, forces_ev_ang, deriva, natoms):
-    """写入 Gaussian External 期望的输出格式。
-
-    Args:
-        energy_ev:     能量 (eV)
-        forces_ev_ang: 力 (eV/Å) 或 None
-        deriva:        0 或 1
-        natoms:        原子数
-    """
-    ene_ha = energy_ev / EV_HA
-    with open(fileout, 'w') as f:
-        f.write(f'{ene_ha:20.12E}{0.0:20.12E}{0.0:20.12E}{0.0:20.12E}\n')
-        if deriva == 0 or forces_ev_ang is None:
-            for _ in range(natoms):
-                f.write(f'{0.0:20.12E}{0.0:20.12E}{0.0:20.12E}\n')
-        else:
-            conv = -1.0 / FORCE_UNIT_CONST
-            for i in range(natoms):
-                f.write(f'{forces_ev_ang[i, 0] * conv:20.12E}'
-                        f'{forces_ev_ang[i, 1] * conv:20.12E}'
-                        f'{forces_ev_ang[i, 2] * conv:20.12E}\n')
+    base = unique_scratch_base(method)
+    energy_ev = ml_compute(method, atoms, charge, spin, base=base)
+    forces = None
+    if deriva == 1:
+        grad = compute_gradient(method, atoms, charge, spin, base=base)
+        if grad is not None:
+            # calculators returns dE/dr in eV/Å, so negate it to get forces in
+            # eV/Å; write_external_output_ev converts to Ha/Bohr for Gaussian.
+            grad = np.asarray(grad, dtype=np.float64)
+            # A wrong shape used to fall through and silently produce zero forces,
+            # which looks to Gaussian like a converged structure. Fail instead.
+            if grad.shape != (len(atoms), 3):
+                raise ValueError(
+                    f'{method} returned a gradient with shape {grad.shape}, '
+                    f'expected {(len(atoms), 3)}')
+            forces = -grad
+    return energy_ev, forces
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -142,149 +95,130 @@ def write_gau_output(fileout, energy_ev, forces_ev_ang, deriva, natoms):
 # ═══════════════════════════════════════════════════════════════════════
 
 class MLIPServer:
-    """持久化 MLIP 推理 server。"""
+    """Persistent MLIP inference server (no model-specific logic)."""
 
-    def __init__(self, method='mace_off24', host='127.0.0.1', port=15556,
+    def __init__(self, method, host='127.0.0.1', port=15556,
                  xyz_out=None):
         self.method = method
         self.host = host
         self.port = port
         self.xyz_out = xyz_out
         self.model_lock = threading.Lock()
-        self.calculator = None
-        self._is_orbmol_v2 = False
-        self._model = None
-        self._atoms_adapter = None
-        # 记录最后一次计算结果，用于退出时保存结构
+        self.ase_calc = None
+        self._ase_spec = None
+        self.device = None
+        # Last computed state, used to write the final structure on shutdown.
         self.last_atoms = None
         self.last_energy = None
         self.last_forces = None
         self._shutdown_flag = threading.Event()
-        self._load_model()
-        #self._warmup()
+        self._load_ase_persistent()
 
-    def _load_model(self):
-        """加载模型到 GPU。"""
-        cfg = MODEL_CONFIGS[self.method]
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self._device = device
-        print(f'[MLIP Server] Loading {self.method} model on {device}...', flush=True)
-        mod = __import__(cfg['from'], fromlist=[cfg['import']])
-        cls_or_fn = getattr(mod, cfg['import'])
+    def _load_ase_persistent(self):
+        """Declarative ASE models: build the calculator once, then reuse it.
 
-        if cfg.get('type') == 'orbmol_v2':
-            self._model, self._atoms_adapter = cls_or_fn(device=device)
-            self._is_orbmol_v2 = True
+        Whether this path applies is decided by calculators.ASE_MODEL_SPECS;
+        this class never inspects method names.
+        """
+        spec = get_ase_spec(self.method)
+        if spec is None:
+            return
+        self._ase_spec = spec
+        self.device = server_device()
+        logger.info('Loading the ASE calculator for %s '
+                    '(once; reused by every later request, device=%s)...',
+                    self.method, self.device)
+        t_load = time.perf_counter()
+        if spec.get('device'):
+            # Only models whose spec declares a device key receive this argument.
+            self.ase_calc = make_ase_calculator(spec, device=self.device)
         else:
-            self.calculator = cls_or_fn(model=cfg['model_path'], device=device)
-        print('[MLIP Server] Model loaded.', flush=True)
+            self.ase_calc = make_ase_calculator(spec)
+        logger.info('ASE calculator loaded in %.2fs',
+                    time.perf_counter() - t_load)
 
-    def _warmup(self):
-        """预热 CUDA JIT / kernel cache。"""
-        try:
-            print('[MLIP Server] Warming up model...', flush=True)
-            atoms = Atoms(numbers=[6, 8], positions=[[0., 0., 0.], [1.2, 0., 0.]])
-            cfg = MODEL_CONFIGS[self.method]
-            if cfg.get('needs_info'):
-                atoms.info["charge"] = 0
-                atoms.info["spin"] = 1
+    def compute(self, filein, fileout, warmup=False):
+        """Handle a single Gaussian External request.
 
-            if self._is_orbmol_v2:
-                graph = self._atoms_adapter.from_ase_atoms(atoms).to(self._device)
-                result = self._model.predict(graph, split=False, compute_forces=True)
-                # Verify energy/forces exist
-                _ = float(result["energy"].cpu().detach())
-                _ = result.get("forces")
-                del atoms, graph, result
-            else:
-                if 'mace_polar' in self.method:
-                    atoms.info["external_field"] = [0.0, 0.0, 0.0]
-                atoms.calc = self.calculator
-                atoms.get_potential_energy()
-                atoms.get_forces()
-                del atoms
-            print('[MLIP Server] Warmup complete.', flush=True)
-        except Exception as e:
-            print(f'[MLIP Server] Warmup warning: {e}', flush=True)
-
-    def compute(self, filein, fileout):
-        """处理一次 Gaussian External 请求。"""
+        The reported time is the computation only: time spent loading a model
+        inside this request (lazily loaded models do that on their first call) is
+        split out and printed as `load=`. A warm-up request is labelled as such so
+        it does not look like the first step of a job.
+        """
         t_start = time.time()
-        eles, coords, deriva, charge, spin = parse_gau_external(filein)
+        take_load_time()      # drop anything left over from an earlier request
+        eles, coords, _atom_charges, deriva, charge, spin = get_external_coord(filein)
 
-        # 直接从数组构建 ASE Atoms（无中间 XYZ 文件）
-        symbols = [_Z_SYMBOLS[int(z)] for z in eles]
+        # Build the ASE Atoms straight from the arrays (no intermediate XYZ file).
+        symbols = [ELEMENTS[int(z)] for z in eles]
         atoms = Atoms(symbols=symbols, positions=coords)
-        cfg = MODEL_CONFIGS[self.method]
-        if cfg.get('needs_info'):
-            atoms.info["charge"] = charge
-            atoms.info["spin"] = spin
 
-        # 加锁推理
-        with self.model_lock:
-            if self._is_orbmol_v2:
-                # orbmol_v2 通过 autograd 计算 forces，不能在 no_grad() 下运行
-                atoms.info["charge"] = int(charge)
-                atoms.info["spin"] = int(spin)
-                graph = self._atoms_adapter.from_ase_atoms(atoms).to(self._device)
-                result = self._model.predict(graph, split=False, compute_forces=True)
-                energy = float(result["energy"].cpu().detach())
-                if deriva == 1 and "forces" in result:
-                    forces = result["forces"].cpu().detach().numpy()
-                else:
-                    forces = None
-                del graph, result
-            else:
-                with torch.no_grad():
-                    if 'mace_polar' in self.method:
-                        atoms.info["external_field"] = [0.0, 0.0, 0.0]
-                    atoms.calc = self.calculator
-                    energy = atoms.get_potential_energy()
-                    forces = None if deriva == 0 else atoms.get_forces()
+        if self.ase_calc is not None:
+            # ── Persistent ASE path (calculator already loaded, reused) ──
+            prepare_ase_atoms(atoms, charge, spin, self._ase_spec)
+            # Deliberately not wrapped in torch.no_grad(): ASE calculators such
+            # as MACE rely on autograd when computing forces, and no_grad would
+            # fail with "element 0 of tensors does not require grad".
+            with self.model_lock:
+                atoms.calc = self.ase_calc
+                energy = atoms.get_potential_energy()
+                forces = None if deriva == 0 else atoms.get_forces()
+        else:
+            # ── Generic path (functional model, called per request) ──
+            energy, forces = _generic_compute(
+                self.method, atoms, charge, spin, deriva)
 
         elapsed = time.time() - t_start
-        print(f'[MLIP Server] Step  natoms={len(eles)}  E={energy:.8f} eV  '
-              f'grad={deriva}  time={elapsed:.3f}s', flush=True)
+        load_seconds = take_load_time()
+        logger.info('%-7s natoms=%d  E=%.8f eV  grad=%d  time=%.3fs%s',
+                    'Warm-up' if warmup else 'Step', len(eles), energy, deriva,
+                    elapsed - load_seconds,
+                    f'  load={load_seconds:.2f}s' if load_seconds > 0.005 else '')
 
-        write_gau_output(fileout, energy, forces, deriva, len(eles))
+        write_external_output_ev(fileout, energy, forces, deriva, len(eles))
 
-        # 缓存最后状态
+        # Remember the last state.
         if self.last_atoms is not None:
             del self.last_atoms
         self.last_atoms = atoms.copy()
         self.last_energy = energy
         self.last_forces = forces
 
-        # 释放 GPU 内存
+        # Release GPU memory.
         del atoms, forces
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _empty_cuda_cache()
 
     def handle_client(self, conn):
-        """处理单个 TCP 客户端连接。"""
+        """Handle one TCP client connection."""
         try:
-            # 读取 filein 路径
             data = b''
             while b'\n' not in data:
                 chunk = conn.recv(4096)
                 if not chunk:
                     return
                 data += chunk
-            filein = data.split(b'\n', 1)[0].decode().strip()
-            remaining = data.split(b'\n', 1)[1]
+            first_line = data.split(b'\n', 1)[0].decode().strip()
 
-            # 读取 fileout 路径
-            data = remaining
-            while b'\n' not in data:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    return
-                data += chunk
-            fileout = data.split(b'\n', 1)[0].decode().strip()
+            if first_line == 'PING':
+                # Lightweight probe: report the model loaded in the server.
+                conn.sendall(f'OK {self.method}\n'.encode())
+            else:
+                warmup = first_line.startswith('WARMUP ')
+                if warmup:
+                    first_line = first_line[len('WARMUP '):].strip()
+                filein = first_line
+                data = data.split(b'\n', 1)[1]
+                while b'\n' not in data:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    data += chunk
+                fileout = data.split(b'\n', 1)[0].decode().strip()
 
-            self.compute(filein, fileout)
-            conn.sendall(b'OK\n')
+                self.compute(filein, fileout, warmup=warmup)
+                conn.sendall(f'OK {self.method}\n'.encode())
         except Exception as e:
+            logger.exception('Request failed: %s', e)
             try:
                 conn.sendall(('ERROR: %s\n' % str(e)).encode())
             except Exception:
@@ -293,8 +227,12 @@ class MLIPServer:
             conn.close()
 
     def _save_final_xyz(self):
-        """退出时保存最后一步的结构到 XYZ 文件。"""
-        if self.last_atoms is None or self.xyz_out is None:
+        """Write the last structure to the XYZ file, if one was requested.
+
+        Nothing is written unless MLIP_XYZ_OUT names a file, so a normal run
+        leaves no .xyz file behind.
+        """
+        if self.last_atoms is None or not self.xyz_out:
             return
         try:
             info = self.last_atoms.info
@@ -302,18 +240,18 @@ class MLIPServer:
             if self.last_forces is not None:
                 self.last_atoms.arrays['forces'] = self.last_forces
             ase_write(self.xyz_out, self.last_atoms)
-            print(f'[MLIP Server] Final structure saved to {self.xyz_out}', flush=True)
+            logger.info('Final structure saved to %s', self.xyz_out)
         except Exception as e:
-            print(f'[MLIP Server] Failed to save XYZ: {e}', flush=True)
+            logger.warning('Failed to save XYZ: %s', e)
 
     def run(self):
-        """启动 server 主循环。"""
+        """Run the server accept loop."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         self.sock.listen(8)
         self.sock.settimeout(1.0)
-        print(f'[MLIP Server] Listening on {self.host}:{self.port}', flush=True)
+        logger.info('Listening on %s:%s', self.host, self.port)
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             while not self._shutdown_flag.is_set():
@@ -324,16 +262,16 @@ class MLIPServer:
                     continue
                 except Exception as e:
                     if not self._shutdown_flag.is_set():
-                        print(f'[MLIP Server] Accept error: {e}', flush=True)
+                        logger.warning('Accept error: %s', e)
 
             executor.shutdown(wait=True)
 
         self._save_final_xyz()
         self.sock.close()
-        print('[MLIP Server] Shut down.', flush=True)
+        logger.info('Shut down.')
 
     def shutdown(self):
-        """信号驱动的优雅关闭。"""
+        """Ask the accept loop to stop (used by the signal handlers)."""
         self._shutdown_flag.set()
 
 
@@ -349,18 +287,27 @@ def main():
     method = os.environ.get('METHOD', 'mace_off24')
     port = int(os.environ.get('MLIP_SERVER_PORT', 15556))
     host = os.environ.get('MLIP_SERVER_HOST', '127.0.0.1')
-    xyz_out = os.environ.get('MLIP_XYZ_OUT', None)
+    # An empty MLIP_XYZ_OUT means "do not write a structure file".
+    xyz_out = os.environ.get('MLIP_XYZ_OUT') or None
 
-    if method not in MODEL_CONFIGS:
-        print(f'[MLIP Server] Unknown METHOD={method}. Available: {list(MODEL_CONFIGS.keys())}',
-              flush=True)
+    from calculators import METHODS as CALCULATOR_METHODS
+    available = sorted(CALCULATOR_METHODS)
+    if method not in available:
+        logger.error('Unknown METHOD=%s. Available: %s', method, available)
         sys.exit(1)
+
+    if get_ase_spec(method):
+        logger.info('%s uses the persistent ASE path.', method)
+    else:
+        logger.info('%s uses the generic path '
+                    '(functional model, cached inside compute when possible).',
+                    method)
 
     server = MLIPServer(method=method, host=host, port=port, xyz_out=xyz_out)
     _server_ref = server
 
     def _handle_signal(signum, frame):
-        print('[MLIP Server] Received shutdown signal.', flush=True)
+        logger.info('Received shutdown signal.')
         server.shutdown()
 
     signal.signal(signal.SIGTERM, _handle_signal)

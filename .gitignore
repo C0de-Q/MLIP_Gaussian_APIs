@@ -2,21 +2,44 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
 
-# 环境变量与密钥（绝不提交）
+# Local configuration and secrets (never committed)
 .env
+config.env
+custom_models.py
+g16-env.sh
+# Exception: the plugin under test/ ships with the repository
+!test/custom_models.py
 
-# 编辑器 / 系统文件
+# Editors and OS files
 .idea/
 .vscode/
 .DS_Store
+GitHub私有仓库使用教程.md
 
 # Jupyter
 .ipynb_checkpoints/
 
-# 数据文件（按需决定；大文件不要进 git）
+# Data files (decide per project; keep large files out of git)
 # data/
 # *.h5
 # *.pkl
+
+# Runtime output
+*.log
+mlip_server_*.log
+dftd4.json
+.EDISP
+dftd4.txt
+gradient
+*.xyz
+# Gaussian files (%chk and friends now land next to the job)
+*.chk
+*.fchk
+*.rwf
+*.int
+*.d2e
+*.skr

@@ -1,0 +1,37 @@
+# MLIP_Gau_APIs dependencies
+#
+# Base dependencies, shared by every interface
+numpy>=1.21
+ase>=3.22
+
+# Testing (optional, only needed to run test/)
+#   pytest
+
+# Everything below is optional: install only the packages of the models you use.
+# Version requirements follow each package's own documentation.
+#
+# MACE family      (mace_omol / mace_off23 / mace_off24 / mace_polar)
+#   mace-torch
+#
+# ANI family       (ani_2x / ani_1x / ani_1ccx)
+#   torchani
+#
+# DeepMD family    (dpa3 / dpa2_drug / dpa4)
+#   deepmd-kit
+#
+# AIMNet2          (aimnet2)
+#   aimnet2calc
+#
+# ORB-Mol family   (orbmol / orbmol_v2)
+#   orb_models
+#   torch
+#
+# GFN2-xTB         (xtb / gxtb)
+#   xtb                # Python API, used by the xtb model
+#   xtb executable     # gxtb mode; set MLIP_XTB_BIN
+#
+# MLatom CLI       (d4ani)
+#   mlatom             # set MLIP_MLATOM_BIN
+#
+# AIQM3            (aiqm3)
+#   aitomic            # set MLIP_AITOMIC_BIN

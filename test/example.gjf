@@ -1,0 +1,11 @@
+%mem=4GB
+%nprocshared=4
+#p opt external="../gau_scripts/Gau_generic.py"
+
+test 
+
+0 1
+O    0.000000    0.000000    2.980000
+H    0.000000    0.756500    3.566000
+H    0.000000   -0.756500    3.566000
+

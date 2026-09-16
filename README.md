@@ -1,4 +1,4 @@
-# MLIP_Gau_APIs
+# MLIP_Gau_servers
 
 Run machine-learned interatomic potentials (MLIPs) from Gaussian 16 through the
 Gaussian External interface. One persistent server loads the model a single time

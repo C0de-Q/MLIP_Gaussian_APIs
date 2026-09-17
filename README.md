@@ -23,7 +23,7 @@ cp g16-env.example.sh g16-env.sh     # only when g16 is not already on PATH
 #    Gaussian resources for whatever it computes itself: %mem=4GB and
 #    %nprocshared=4 are enough, because the energy and gradients come from the MLIP
 #    server.
-#    external="python /abs/path/MLIP_Gau_APIs/gau_scripts/Gau_generic.py"
+#    external="/abs/path/MLIP_Gau_APIs/gau_scripts/Gau_generic.py"
 #    test/example.gjf is a minimal job to copy and edit.
 
 # 3. Run (starts the server, runs g16, stops the server)
@@ -175,7 +175,7 @@ charges — into an `.xyz`, returns zero energy and gradients, and exits, so the
 finishes at once. No MLIP server is involved.
 
 ```text
-#p external="python /abs/path/MLIP_Gau_APIs/gau_scripts/Gau_debug.py"
+#p external="/abs/path/MLIP_Gau_APIs/gau_scripts/Gau_debug.py"
 ```
 
 ```bash
@@ -187,6 +187,10 @@ The `.xyz` lands in the job directory, named after the file Gaussian hands to th
 interface (`Gau-<pid>_test.xyz`); the charge, spin, atom count and point-charge sum
 go into the job log. `./RunMLIPgjf.sh -m <method> job.gjf` works as well, but it
 starts a server this job never uses.
+
+## Contact
+
+If you have any questions, please contact us at codeq6398@gmail.com.
 
 ## License
 

@@ -62,6 +62,43 @@ def get_cached_model(key, builder):
         return obj
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Handing results from the energy call to the gradient call
+# ═══════════════════════════════════════════════════════════════════════
+
+# The server calls compute_<method>(...) and then grad_<method>(...) with the same
+# `base` when a step needs both. Models whose gradient cannot ride on the Atoms
+# object (autograd tensors, an external program, any non-ASE interface) evaluate
+# once in the energy function and hand the result over here instead of computing
+# twice. Bounded and locked, because requests are served by several threads.
+_RESULTS = {}
+_RESULTS_LOCK = threading.Lock()
+_MAX_RESULTS = 8
+
+
+def store_result(base, **values):
+    """Keep values of the energy call for the gradient call of the same request.
+
+    Call it from a compute_<method> function; read it back with take_result(base)
+    from the matching grad_<method>. A base of None (the caller passed no base)
+    stores nothing, so such calls simply compute again instead of colliding.
+    """
+    if base is None:
+        return
+    with _RESULTS_LOCK:
+        _RESULTS[base] = values
+        while len(_RESULTS) > _MAX_RESULTS:
+            _RESULTS.pop(next(iter(_RESULTS)))
+
+
+def take_result(base):
+    """Return the values stored for base and forget them, or None."""
+    if base is None:
+        return None
+    with _RESULTS_LOCK:
+        return _RESULTS.pop(base, None)
+
+
 def register_method(name, fn=None):
     """Register a custom energy function, as a decorator or a direct call:
 

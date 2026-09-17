@@ -87,7 +87,7 @@ configured in `config.env`; the repository ships no machine-specific paths.
 | dpa2_drug / dpa3 / dpa4 | `deepmd-kit` | `MLIP_MODEL_DPA*` | dpa3 passes charge/spin as `fparam`, dpa4 as `charge_spin` |
 | aimnet2 | `aimnet2calc` | — | built-in model |
 | ani_1x / ani_1ccx / ani_2x | `torchani` | — | |
-| orbmol / orbmol_v2 | `orb_models`, `torch` | — | weights download automatically |
+| orbmol / orbmol_v2 | `orb_models` (recent release), `torch` ≥ 2.4 | `MLIP_MODEL_ORBMOL*` (optional local weights) | charge and spin are model inputs; weights download automatically when the path is not set |
 | xtb / gxtb | `xtb` package or executable | `MLIP_XTB_BIN` | gxtb runs the executable |
 | aiqm3 | `aitomic` | `MLIP_AITOMIC_BIN` | |
 | d4ani | `mlatom` | `MLIP_MLATOM_BIN` | |
@@ -169,10 +169,24 @@ against a direct ASE calculation, so it needs no weights; DPA4 cases skip unless
 
 ## Debugging
 
-```bash
-# Gaussian External input -> .xyz, with zero energy and gradients written back
-python gau_scripts/Gau_debug.py layer inputfile outputfile
+Put the debug script in the method line and run the job as usual: it writes the
+geometry Gaussian hands to the interface — coordinates, charge, spin and point
+charges — into an `.xyz`, returns zero energy and gradients, and exits, so the job
+finishes at once. No MLIP server is involved.
+
+```text
+#p external="python /abs/path/MLIP_Gau_APIs/gau_scripts/Gau_debug.py"
 ```
+
+```bash
+source g16-env.sh        # whatever loads g16 for you
+g16 < job.gjf
+```
+
+The `.xyz` lands in the job directory, named after the file Gaussian hands to the
+interface (`Gau-<pid>_test.xyz`); the charge, spin, atom count and point-charge sum
+go into the job log. `./RunMLIPgjf.sh -m <method> job.gjf` works as well, but it
+starts a server this job never uses.
 
 ## License
 

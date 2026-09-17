@@ -1,6 +1,12 @@
 """
-calculators/_orb.py — ORB-Mol v3 conservative omol / v2
+calculators/_orb.py — ORB-Moland ORB-Mol v2
+
+Upstream usage: the pretrained factories return (model, atoms_adapter), the ASE
+calculator takes both, and the OrbMol models require the total charge and spin
+multiplicity in atoms.info. Energy and forces then come from one evaluation.
 """
+
+import os
 
 from constants import server_device
 from ._registry import register_method, register_gradient, get_cached_model
@@ -8,75 +14,61 @@ from ._registry import register_method, register_gradient, get_cached_model
 
 @register_method('orbmol')
 def compute_orbmol(atoms, charge, spin, base=None):
-    """Orb v3 conservative omol model."""
-    import torch
-    from orb_models.forcefield import atomic_system, pretrained
+    """ORB-Mol v3 conservative omol."""
+    from orb_models.forcefield import pretrained
+    from orb_models.forcefield.inference.calculator import ORBCalculator
 
-    device = torch.device(server_device())
-    orbff = get_cached_model(
-        ('orbmol', str(device)),
-        lambda: pretrained.orb_v3_conservative_omol(
-            device=device, precision='float32-high'),
-    )
-    atoms.info["charge"] = charge
-    atoms.info["spin"] = spin
-    graph = atomic_system.ase_atoms_to_atom_graphs(
-        atoms, orbff.system_config, device=device,
-    )
-    result = orbff.predict(graph, split=False)
-    return float(result["energy"])  # eV
+    device = server_device()
+    atoms.info['charge'] = int(charge)
+    atoms.info['spin'] = int(spin)
+
+    def build():
+        options = dict(device=device, precision='float32-high')
+        weights = os.environ.get('MLIP_MODEL_ORBMOL')
+        if weights:
+            options['weights_path'] = weights
+        orbff, atoms_adapter = pretrained.orb_v3_conservative_omol(**options)
+        return ORBCalculator(orbff, atoms_adapter=atoms_adapter, device=device)
+
+    key = ('orbmol', str(device))
+    atoms.calc = get_cached_model(key, build)
+    return float(atoms.get_potential_energy())          # eV
 
 
 @register_gradient('orbmol')
 def grad_orbmol(atoms, charge, spin, base=None):
-    """Orb v3 conservative omol gradient."""
-    import torch
-    from orb_models.forcefield import atomic_system, pretrained
-
-    device = torch.device(server_device())
-    orbff = get_cached_model(
-        ('orbmol', str(device)),
-        lambda: pretrained.orb_v3_conservative_omol(
-            device=device, precision='float32-high'),
-    )
-    atoms.info['charge'] = charge
-    atoms.info['spin'] = spin
-    graph = atomic_system.ase_atoms_to_atom_graphs(
-        atoms, orbff.system_config, device=device)
-    result = orbff.predict(graph, split=False)
-    forces = result['grad_forces'].detach().cpu().numpy()
-    return [[-f[0], -f[1], -f[2]] for f in forces]
+    """dE/dr in eV/Å, from the evaluation the energy call already did."""
+    if atoms.calc is None:
+        compute_orbmol(atoms, charge, spin, base)
+    return [[-f[0], -f[1], -f[2]] for f in atoms.get_forces()]   # eV/Å
 
 
 @register_method('orbmol_v2')
-def compute_orbmol_v2(atoms, charge, spin, base=None, device=None):
-    """Orb v2 model (orbmol_v2 factory plus its atoms adapter).
+def compute_orbmol_v2(atoms, charge, spin, base=None):
+    """ORB-Mol v2, the architecture with long-range electrostatics."""
+    from orb_models.forcefield import pretrained
+    from orb_models.forcefield.inference.calculator import ORBCalculator
 
-    device may be 'cuda:N' or 'cpu'; by default it comes from MLIP_SERVER_DEVICE.
-    """
-    import torch
-    from orb_models.forcefield.pretrained import orbmol_v2
+    device = server_device()
+    atoms.info['charge'] = int(charge)
+    atoms.info['spin'] = int(spin)
 
-    if device is None:
-        device = server_device()
-    model, atoms_adapter = get_cached_model(
-        ('orbmol_v2', device),
-        lambda: orbmol_v2(device=torch.device(device)),
-    )
-    atoms.info["charge"] = int(charge)
-    atoms.info["spin"] = int(spin)
-    graph = atoms_adapter.from_ase_atoms(atoms).to(device)
-    result = model.predict(graph, split=False, compute_forces=True)
-    energy = float(result["energy"].cpu().detach())
-    if "forces" in result:
-        atoms.arrays["forces"] = result["forces"].cpu().detach().numpy()
-    return energy  # eV
+    def build():
+        options = dict(device=device, precision='float32-high')
+        weights = os.environ.get('MLIP_MODEL_ORBMOL_V2')
+        if weights:
+            options['weights_path'] = weights
+        orbff, atoms_adapter = pretrained.orbmol_v2(**options)
+        return ORBCalculator(orbff, atoms_adapter=atoms_adapter, device=device)
+
+    key = ('orbmol_v2', str(device))
+    atoms.calc = get_cached_model(key, build)
+    return float(atoms.get_potential_energy())          # eV
 
 
 @register_gradient('orbmol_v2')
 def grad_orbmol_v2(atoms, charge, spin, base=None):
-    """Orb v2 gradient, reusing the forces that compute_orbmol_v2 stored."""
-    forces = atoms.arrays.get('forces')
-    if forces is None:
-        raise RuntimeError('compute_orbmol_v2 did not store forces, so no gradient is available')
-    return [[-f[0], -f[1], -f[2]] for f in forces]
+    """dE/dr in eV/Å, from the evaluation the energy call already did."""
+    if atoms.calc is None:
+        compute_orbmol_v2(atoms, charge, spin, base)
+    return [[-f[0], -f[1], -f[2]] for f in atoms.get_forces()]   # eV/Å

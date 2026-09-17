@@ -9,39 +9,24 @@ a temporary directory and keeps the result in memory, so a run leaves no .xyz,
 import os
 import shutil
 import tempfile
-import threading
 
 import numpy as np
 
 from constants import CLI_PATHS, EV_HA
 from gaussian_external import unique_scratch_base
-from ._registry import register_method, register_gradient
-
-# Energy and gradient of the most recent CLI runs, keyed by scratch base. The
-# gradient is produced by the same run as the energy and the server requests it
-# in a separate call with that base, so caching it also keeps that call file-free.
-_RESULTS = {}
-_RESULTS_LOCK = threading.Lock()
-_MAX_RESULTS = 8
-
-
-def _store_result(base, energy_ev, grad):
-    with _RESULTS_LOCK:
-        _RESULTS[base] = (energy_ev, grad)
-        while len(_RESULTS) > _MAX_RESULTS:
-            _RESULTS.pop(next(iter(_RESULTS)))
-
+from ._registry import register_method, register_gradient, store_result, take_result
 
 def _cached_gradient(name, base):
-    with _RESULTS_LOCK:
-        result = _RESULTS.get(base)
+    """Gradient of the CLI run whose energy call stored it under base."""
+    result = take_result(base)
     if result is None:
         raise RuntimeError(
             f'{name} reads its gradient from the energy evaluation that produced '
             f'base={base}, and no such evaluation is cached')
-    if result[1] is None:
+    grad = result.get('grad')
+    if grad is None:
         raise RuntimeError(f'{name} produced no gradient for base={base}')
-    return result[1]
+    return grad
 
 
 def _run_cli(program, method_name, atoms, charge, spin, base=None,
@@ -82,7 +67,7 @@ def _run_cli(program, method_name, atoms, charge, spin, base=None,
             grad = _read_cli_gradient(len(atoms), grad_path)
         except OSError:
             grad = None      # an energy-only run may produce no gradient file
-        _store_result(base, energy_ev, grad)
+        store_result(base, energy=energy_ev, grad=grad)
         return energy_ev
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

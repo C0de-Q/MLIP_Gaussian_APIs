@@ -7,7 +7,7 @@ file automatically when it is imported.
 
 Three steps:
 
-1. **Register the model** — Option A or B below.
+1. **Register the model** — Option A, B or C below.
 2. **Add its weight path to `config.env`** if it loads a weight file:
 
    ```bash
@@ -54,44 +54,66 @@ Spec keys: `module`, `factory`, `model`, `device`, `default_dtype`, `needs_info`
   `atoms.info['charge']` and `['spin']`, which is exactly what MACE reads; use
   `needs_info=False` to skip them.
 
-## Option B: functional (autograd, CLI, non-ASE interfaces)
+## Option B: functional, gradient carried on the atoms
 
-Decorated functions in `custom_models.py`; anything that returns eV and dE/dr in
-eV/Å can be hosted. They are **not** persisted by default, so a model that is
-expensive to build must be cached inside the function:
-
-```python
-@register_method('mymodel2')
-def compute_mymodel2(atoms, charge, spin, base=None):
-    return energy_ev            # eV
-
-@register_gradient('mymodel2')  # only if the default ASE gradient does not fit
-def grad_mymodel2(atoms, charge, spin, base=None):
-    return grad                 # dE/dr in eV/Å, shape (natoms, 3)
-```
-
-For a slow model, build it once and reuse the instance:
+A decorated function whose energy call leaves the forces on the atoms, so the
+gradient function is a lookup instead of a second evaluation:
 
 ```python
-def _build():
-    from constants import require_model_path, server_device
-    from mypackage import MyModel
-    return MyModel(model=require_model_path('mymodel2'), device=server_device())
+from calculators import register_method, register_gradient, store_result, take_result
 
 @register_method('mymodel2')
 def compute_mymodel2(atoms, charge, spin, base=None):
-    model = get_cached_model('mymodel2_model', _build)   # loaded once
-    ...
+    atoms.calc = MyCalculator(model=require_model_path('mymodel2'))   # or
+    # atoms.arrays['forces'] = ...      # if the model hands you forces directly
+    return atoms.get_potential_energy()  # eV
 
 @register_gradient('mymodel2')
 def grad_mymodel2(atoms, charge, spin, base=None):
-    model = get_cached_model('mymodel2_model', _build)   # same instance
-    ...
+    forces = atoms.get_forces()          # already computed by the energy call
+    return [[-f[0], -f[1], -f[2]] for f in forces]   # dE/dr in eV/Å
 ```
 
-Working examples: `calculators/_ani.py` (autograd, cached), `calculators/_orb.py`
-(non-ASE model plus adapter), `calculators/_cli.py` (external program in a
-temporary directory, so it cannot be cached).
+That is the server's default ASE gradient written out. With `atoms.calc` set you may
+leave the gradient function out, but writing it keeps the sign and units visible;
+when the energy call only fills `atoms.arrays['forces']`, it is required — there is
+no calculator for `atoms.get_forces()` to use.
+
+The model object itself lives outside the step: `get_cached_model(key, builder)`
+builds it once per process, so a slow model is not reloaded on every request.
+
+## Option C: functional, gradient handed over by `base`
+
+For a gradient that cannot ride on the atoms — autograd over your own tensors, a CLI
+that returns energy and gradient together, any non-ASE interface — pass the result
+from the energy call to the gradient call through `base`, which both calls receive
+and which is unique per request:
+
+```python
+@register_method('mymodel2')
+def compute_mymodel2(atoms, charge, spin, base=None):
+    energy, grad = my_model(atoms)       # one evaluation, both results
+    store_result(base, energy=energy, grad=grad)
+    return energy                        # eV
+
+@register_gradient('mymodel2')
+def grad_mymodel2(atoms, charge, spin, base=None):
+    cached = take_result(base)
+    if cached is not None:
+        return cached['grad']            # dE/dr in eV/Å, shape (natoms, 3)
+    return my_model(atoms)[1]            # no cache: compute it here
+```
+
+`store_result` and `take_result` come from `calculators/`: a dict keyed by `base`,
+locked and bounded, so the two calls of one request see the same values and nothing
+accumulates. Keep the fallback branch — a gradient request must work even without a
+preceding energy call — and cache the model itself with `get_cached_model` as in
+Option B.
+
+Working examples: `calculators/_aimnet.py` (Option B, calculator attached plus the
+explicit gradient), `calculators/_orb.py` `orbmol_v2` (Option B, forces on the
+atoms), `calculators/_ani.py` and `calculators/_cli.py` (Option C, one evaluation
+then handed over through `base`).
 
 ## Gradients and forces
 
@@ -112,8 +134,8 @@ relaxes the geometry the wrong way.
 
 Nothing else to do — a declarative entry or `@register_method` is enough for the
 generic path, and `MLIPServer` makes no method-name decisions. Option A is
-persisted automatically; Option B is loaded on the first request only if the
-function caches it with `get_cached_model`. RunMLIPgjf.sh sends one warm-up
+persisted automatically; Options B and C are loaded on the first request only if
+the function caches them with `get_cached_model`. RunMLIPgjf.sh sends one warm-up
 calculation before the jobs, so that first load happens there and not inside your
 first Gaussian step.
 

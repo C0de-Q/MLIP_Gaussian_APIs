@@ -187,6 +187,22 @@ def test_load_time_is_reported_separately():
     assert calculators.take_load_time() == 0.0, 'a cache hit adds no load time'
 
 
+def test_result_hand_over_is_bounded_and_cleared():
+    """store_result/take_result pass values between the two entry points."""
+    calculators.store_result('handover-a', energy=-1.0, grad=[[0.0, 0.0, 0.0]])
+    stored = calculators.take_result('handover-a')
+    assert stored['energy'] == -1.0 and stored['grad'] == [[0.0, 0.0, 0.0]]
+    assert calculators.take_result('handover-a') is None, 'taking clears it'
+
+    calculators.store_result(None, energy=1.0)          # no base: nothing stored
+    assert calculators.take_result(None) is None
+
+    for i in range(12):                                 # the cache stays small
+        calculators.store_result(f'handover-{i}', energy=float(i))
+    assert calculators.take_result('handover-0') is None, 'oldest entry evicted'
+    assert calculators.take_result('handover-11')['energy'] == 11.0
+
+
 def test_server_builds_calculator_once(server, job):
     """Persistent ASE path: the calculator is built at startup and reused per step."""
     srv, _port = server

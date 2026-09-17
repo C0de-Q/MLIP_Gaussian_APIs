@@ -45,6 +45,8 @@ from ._registry import (
     register_gradient,
     get_cached_model,
     take_load_time,
+    store_result,
+    take_result,
     make_ase_calculator,
     prepare_ase_atoms,
     register_ase_model,
@@ -62,6 +64,7 @@ __all__ = [
     'register_method', 'register_gradient', 'register_ase_model',
     'get_cached_model', 'make_ase_calculator', 'prepare_ase_atoms', 'get_ase_spec',
     'compute', 'compute_gradient', 'load_custom_models', 'take_load_time',
+    'store_result', 'take_result',
 ]
 
 logger = logging.getLogger('calculators')
